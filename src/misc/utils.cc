@@ -45,14 +45,55 @@ ncclResult_t busIdToInt64(const char* busId, int64_t* id) {
   return ncclSuccess;
 }
 
-// Convert a logical cudaDev index to the NVML device minor number
+// Convert a logical cudaDev index to the NVML device minor number.
+//
+// TorchPass patch: after CRIU restore with cuda-checkpoint, the CUDA
+// runtime's cudaDeviceGetPCIBusId may return a stale PCI bus ID from
+// the source node (driver bug). If the cudart-returned bus ID doesn't
+// resolve via NVML, fall back to reading from a file written by the
+// TorchPass companion. Safe on non-migration systems (fallback never
+// triggers).
 ncclResult_t getBusId(int cudaDev, int64_t *busId) {
-  // On most systems, the PCI bus ID comes back as in the 0000:00:00.0
-  // format. Still need to allocate proper space in case PCI domain goes
-  // higher.
   char busIdStr[] = "00000000:00:00.0";
   CUDACHECK(cudaDeviceGetPCIBusId(busIdStr, sizeof(busIdStr), cudaDev));
-  NCCLCHECK(busIdToInt64(busIdStr, busId));
+
+  nvmlDevice_t nvmlDev;
+  ncclResult_t nvmlRet = ncclNvmlDeviceGetHandleByPciBusId(busIdStr, &nvmlDev);
+  if (nvmlRet == ncclSuccess) {
+    NCCLCHECK(busIdToInt64(busIdStr, busId));
+    return ncclSuccess;
+  }
+
+  INFO(NCCL_INIT, "getBusId: cudaDev %d busId %s not found in NVML, trying file fallback", cudaDev, busIdStr);
+
+  const char* busidsPath = getenv("TORCHPASS_GPU_BUSIDS_FILE");
+  if (!busidsPath) busidsPath = "/var/run/torchpass-state/gpu_busids.txt";
+
+  FILE* f = fopen(busidsPath, "r");
+  if (!f) {
+    WARN("getBusId: cudaDev %d stale busId %s and no fallback file at %s", cudaDev, busIdStr, busidsPath);
+    return ncclUnhandledCudaError;
+  }
+
+  char line[128];
+  char foundBusId[32] = {};
+  while (fgets(line, sizeof(line), f)) {
+    int ord = -1;
+    char bid[64] = {};
+    if (sscanf(line, "%d %63s", &ord, bid) == 2 && ord == cudaDev) {
+      strncpy(foundBusId, bid, sizeof(foundBusId) - 1);
+      break;
+    }
+  }
+  fclose(f);
+
+  if (!foundBusId[0]) {
+    WARN("getBusId: cudaDev %d not found in %s", cudaDev, busidsPath);
+    return ncclUnhandledCudaError;
+  }
+
+  INFO(NCCL_INIT, "getBusId: cudaDev %d resolved via file %s -> busId %s", cudaDev, busidsPath, foundBusId);
+  NCCLCHECK(busIdToInt64(foundBusId, busId));
   return ncclSuccess;
 }
 
